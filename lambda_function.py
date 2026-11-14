@@ -11,7 +11,8 @@ Function นี้รับ event 4 แบบ
 
 ChatOps
   • run <id> <command>  สั่งคำสั่งบนเครื่องผ่าน Systems Manager (ไม่ต้อง SSH)
-  • duration ใน template + เตือนก่อนหมดเวลา + stop อัตโนมัติ + ปุ่มต่อเวลา
+  • duration ใน template (10 นาที - 8 ชม.) + เตือนก่อนหมดเวลา + stop อัตโนมัติ + ปุ่มต่อเวลา
+  • test-alarm <id> จำลอง CPU alarm จากแชท (ทดสอบเส้นทางแจ้งเตือนโดยไม่ต้องใช้ CloudShell)
   • CloudWatch Alarm เมื่อ CPU เกินเกณฑ์ -> push เข้า LINE
   • SSH key แยกรายเครื่อง สร้างใหม่ทุกคำขอ ลบเมื่อ terminate
 """
@@ -43,6 +44,7 @@ CPU_ALARM_THRESHOLD = float(os.environ.get("CPU_ALARM_THRESHOLD", "70"))
 DEFAULT_HOURS = int(os.environ.get("DEFAULT_HOURS", "2"))
 MAX_HOURS = int(os.environ.get("MAX_HOURS", "8"))
 WARN_MINUTES = int(os.environ.get("WARN_MINUTES", "15"))
+MIN_MINUTES = int(os.environ.get("MIN_MINUTES", "10"))  # ขอเครื่องได้สั้นสุดกี่นาที
 MAX_FILE_MB = 10
 LINK_TTL = 3600       # ลิงก์ไฟล์ทั่วไป 1 ชั่วโมง
 KEY_LINK_TTL = 600    # ลิงก์ SSH key 10 นาที
@@ -91,7 +93,8 @@ systemctl enable --now nginx
 
 TEMPLATE_TEXT = (
     "คัดลอกข้อความด้านล่าง แก้ค่าแล้วส่งกลับมาครับ\n\n"
-    "#ec2\nuser: ชื่อของคุณ\ntype: t3.micro\npurpose: web\nduration: 2h"
+    "#ec2\nuser: ชื่อของคุณ\ntype: t3.micro\npurpose: web\nduration: 2h\n\n"
+    f"duration ใส่ได้ {MIN_MINUTES}m ถึง {MAX_HOURS}h เช่น 10m สำหรับทดลองการเตือนก่อนหยุด"
 )
 
 
@@ -109,18 +112,20 @@ HELP_TEXT = (
     "• status — ดูเครื่องของฉัน\n"
     "• run <id> <command> — สั่งงานบนเครื่อง\n"
     f"  command: {', '.join(RUN_COMMANDS)}\n"
-    "• extend <id> <ชม.> — ต่อเวลาใช้งาน\n"
+    "• extend <id> <เวลา> — ต่อเวลาใช้งาน เช่น 30m, 1h\n"
+    "• test-alarm <id> — จำลอง CPU alarm เพื่อทดสอบการแจ้งเตือน\n"
     "• stop <id> / start <id> / terminate <id>\n"
     "• key <id> — ลิงก์ SSH key ของเครื่อง\n"
     "• ส่งรูปหรือไฟล์ — ฝากเข้า S3 · files — ดูไฟล์ของฉัน\n"
     "• report — รายงานการใช้งานและค่าใช้จ่าย\n"
     "• template — ตัวอย่างคำขอเครื่อง\n"
-    f"ชนิดเครื่อง: {', '.join(INSTANCE_TYPES)} · ใช้ได้ 1-{MAX_HOURS} ชม."
+    f"ชนิดเครื่อง: {', '.join(INSTANCE_TYPES)}\n"
+    f"duration: {MIN_MINUTES}m ถึง {MAX_HOURS}h เช่น 10m, 30m, 2h"
 )
 
 GREETINGS = {"สวัสดี", "สวัสดีครับ", "สวัสดีค่ะ", "หวัดดี", "ดีจ้า", "hello", "hi", "hey", "เริ่ม"}
 
-SAMPLE_REQUEST = "#ec2\nuser: demo\ntype: t3.micro\npurpose: web\nduration: 1h"
+SAMPLE_REQUEST = "#ec2\nuser: demo\ntype: t3.micro\npurpose: web\nduration: 10m"
 
 WELCOME_TEXT = (
     "👋 สวัสดีครับ ยินดีต้อนรับสู่ Cloud Resource Bot\n"
@@ -222,7 +227,9 @@ def handle_text(msg, user_id, token):
     if cmd == "result" and len(parts) == 2:
         return reply(token, [text(command_result(parts[1], user_id))])
     if cmd == "extend" and len(parts) == 3:
-        return reply(token, [text(extend_instance(parts[1], parse_hours(parts[2]), user_id))])
+        return reply(token, [text(extend_instance(parts[1], parse_minutes(parts[2]), user_id))])
+    if cmd == "test-alarm" and len(parts) == 2:
+        return reply(token, [text(test_alarm(parts[1], user_id))])
     if cmd in ("stop", "start") and len(parts) == 2:
         return reply(token, [text(change_state(cmd, parts[1], user_id))])
     if cmd == "terminate" and len(parts) == 2:
@@ -251,15 +258,38 @@ def parse_template(msg):
     return fields
 
 
-def parse_hours(value):
-    """'2h', '2', '90m' -> จำนวนชั่วโมง (ปัดขึ้น) หรือ None ถ้าอ่านไม่ได้"""
-    v = (value or "").strip().lower()
+def parse_minutes(value):
+    """'10m', '90 min', '2h', '1.5h', '2' (ชั่วโมง) -> จำนวนนาที หรือ None ถ้าอ่านไม่ได้"""
+    v = (value or "").strip().lower().replace(" ", "")
     try:
+        if v.endswith("min"):
+            return int(v[:-3])
         if v.endswith("m"):
-            return max(1, -(-int(v[:-1]) // 60))
-        return int(v.rstrip("h").strip())
+            return int(v[:-1])
+        return int(round(float(v.rstrip("h")) * 60))
     except ValueError:
         return None
+
+
+def valid_minutes(minutes):
+    return minutes is not None and MIN_MINUTES <= minutes <= MAX_HOURS * 60
+
+
+def fmt_minutes(minutes):
+    h, m = divmod(int(minutes), 60)
+    if h and m:
+        return f"{h} ชม. {m} นาที"
+    return f"{h} ชม." if h else f"{m} นาที"
+
+
+def warn_lead(total_minutes):
+    """เตือนก่อนหยุดกี่นาที: ปกติ WARN_MINUTES แต่คำขอสั้นเตือนที่ครึ่งหนึ่งของเวลา"""
+    return max(1, min(WARN_MINUTES, int(total_minutes) // 2))
+
+
+def schedule_tags(stop_at, total_minutes):
+    return {"StopAt": iso(stop_at), "WarnAt": iso(stop_at - timedelta(minutes=warn_lead(total_minutes))),
+            "Warned": ""}
 
 
 def handle_ec2_request(msg, token):
@@ -267,7 +297,7 @@ def handle_ec2_request(msg, token):
     owner = f.get("user", "")
     itype = f.get("type", "t3.micro").lower()
     purpose = f.get("purpose", "-")
-    hours = parse_hours(f.get("duration", str(DEFAULT_HOURS)))
+    minutes = parse_minutes(f.get("duration", f"{DEFAULT_HOURS}h"))
 
     errors = []
     if not owner:
@@ -276,20 +306,20 @@ def handle_ec2_request(msg, token):
         errors.append("• type ต้องเป็น " + ", ".join(INSTANCE_TYPES))
     if len(owner) > 30 or len(purpose) > 30:
         errors.append("• user และ purpose ยาวได้ไม่เกิน 30 ตัวอักษร")
-    if hours is None or not 1 <= hours <= MAX_HOURS:
-        errors.append(f"• duration ต้องอยู่ระหว่าง 1h ถึง {MAX_HOURS}h")
+    if not valid_minutes(minutes):
+        errors.append(f"• duration ต้องอยู่ระหว่าง {MIN_MINUTES}m ถึง {MAX_HOURS}h เช่น 10m, 30m, 2h")
     if errors:
         return reply(token, [text("คำขอไม่ถูกต้อง\n" + "\n".join(errors) + "\n\nพิมพ์ help เพื่อดูตัวอย่าง")])
 
-    data = urllib.parse.urlencode({"a": "ec2", "t": itype, "u": owner, "p": purpose, "d": hours})
+    data = urllib.parse.urlencode({"a": "ec2", "t": itype, "u": owner, "p": purpose, "d": minutes})
     if len(data) > 300:  # LINE จำกัด postback data 300 ตัวอักษร
         return reply(token, [text("ชื่อหรือ purpose ยาวเกินไป กรุณาย่อให้สั้นลง")])
 
     cost = INSTANCE_TYPES[itype]["usd_hr"]
     summary = (f"สรุปคำขอ EC2\nผู้ขอ: {owner}\nชนิด: {itype} ({INSTANCE_TYPES[itype]['vcpu']} vCPU)\n"
                f"OS: Amazon Linux 2023 + nginx\nใช้สำหรับ: {purpose}\n"
-               f"ระยะเวลา: {hours} ชม. (หยุดอัตโนมัติ เตือนก่อน {WARN_MINUTES} นาที)\n"
-               f"ค่าใช้จ่ายประมาณ ${cost}/ชม. (≈ ${cost * hours:.3f} ตลอดช่วง)")
+               f"ระยะเวลา: {fmt_minutes(minutes)} (หยุดอัตโนมัติ เตือนก่อน {warn_lead(minutes)} นาที)\n"
+               f"ค่าใช้จ่ายประมาณ ${cost}/ชม. (≈ ${cost * minutes / 60:.3f} ตลอดช่วง)")
     reply(token, [confirm_message(summary, data)])
 
 
@@ -309,7 +339,7 @@ def handle_postback(data, user_id, token, context):
             FunctionName=context.function_name,
             InvocationType="Event",
             Payload=json.dumps({"task": "create_ec2", "user_id": user_id, "type": p["t"],
-                                "owner": p["u"], "purpose": p["p"], "hours": int(p["d"])}).encode(),
+                                "owner": p["u"], "purpose": p["p"], "minutes": int(p["d"])}).encode(),
         )
         return reply(token, [text("รับคำขอแล้ว กำลังสร้างเครื่อง โปรดรอประมาณ 1-2 นาที "
                                   "ระบบจะแจ้งกลับเมื่อพร้อมใช้งาน")])
@@ -317,7 +347,8 @@ def handle_postback(data, user_id, token, context):
     if action == "term":
         return reply(token, [text(terminate_instance(p["id"], user_id))])
     if action == "extend":
-        return reply(token, [text(extend_instance(p["id"], int(p["h"]), user_id))])
+        minutes = int(p["m"]) if "m" in p else int(p.get("h", 1)) * 60  # รองรับปุ่มรุ่นเก่า (h=ชั่วโมง)
+        return reply(token, [text(extend_instance(p["id"], minutes, user_id))])
     if action == "stopnow":
         return reply(token, [text(change_state("stop", p["id"], user_id))])
     if action == "run":
@@ -399,7 +430,8 @@ def create_ec2_worker(job):
                       ServerSideEncryption="AES256")
 
         # 2) สร้างเครื่อง พร้อม instance profile (สำหรับ SSM) และ detailed monitoring (alarm 1 นาที)
-        stop_at = utc_now() + timedelta(hours=int(job["hours"]))
+        minutes = int(job.get("minutes") or int(job.get("hours", DEFAULT_HOURS)) * 60)
+        stop_at = utc_now() + timedelta(minutes=minutes)
         resp = ec2.run_instances(
             ImageId=AMI_ID,
             InstanceType=job["type"],
@@ -416,8 +448,7 @@ def create_ec2_worker(job):
                 {"Key": "RequestedBy", "Value": job["owner"]},
                 {"Key": "Purpose", "Value": job["purpose"]},
                 {"Key": "KeyName", "Value": key_name},
-                {"Key": "StopAt", "Value": iso(stop_at)},
-            ]}],
+            ] + [{"Key": k, "Value": v} for k, v in schedule_tags(stop_at, minutes).items() if v]}],
         )
         iid = resp["Instances"][0]["InstanceId"]
 
@@ -433,7 +464,7 @@ def create_ec2_worker(job):
             **text(
                 f"✅ เครื่องพร้อมใช้งาน\nID: {iid}\nชนิด: {job['type']}\nPublic IP: {ip}\n"
                 f"เว็บ (รอ nginx ~1 นาที): http://{ip}\n"
-                f"หยุดอัตโนมัติ: {th_time(stop_at)} น.\n"
+                f"หยุดอัตโนมัติ: {th_time(stop_at)} น. (เตือนก่อน {warn_lead(minutes)} นาที)\n"
                 f"แจ้งเตือนเมื่อ CPU > {CPU_ALARM_THRESHOLD:.0f}%\n\n"
                 f"สั่งงานผ่านแชทได้เลย (รอ SSM ลงทะเบียน 1-2 นาที) เช่น\nrun {iid} disk\n\n"
                 f"SSH key เฉพาะเครื่องนี้ (ลิงก์อายุ 10 นาที, ขอใหม่: key {iid}):\n"
@@ -481,7 +512,7 @@ def change_state(cmd, iid, user_id):
     if len(running) >= MAX_INSTANCES:
         return "ไม่สามารถเปิดเครื่องเพิ่มได้ เพราะจะเกินเพดานของระบบ"
     stop_at = utc_now() + timedelta(hours=DEFAULT_HOURS)  # เปิดใหม่ได้เวลาใช้งานรอบใหม่
-    set_tags(iid, StopAt=iso(stop_at), Warned="")
+    set_tags(iid, **schedule_tags(stop_at, DEFAULT_HOURS * 60))
     ec2.start_instances(InstanceIds=[iid])
     return (f"สั่งเปิดเครื่อง {iid} แล้ว จะหยุดอัตโนมัติเวลา {th_time(stop_at)} น.\n"
             "IP ใหม่จะแสดงในคำสั่ง status ภายใน 1 นาที")
@@ -502,18 +533,35 @@ def terminate_instance(iid, user_id):
     return f"สั่งลบเครื่อง {iid} แล้ว พร้อมลบ SSH key และ alarm ของเครื่องนี้"
 
 
-def extend_instance(iid, hours, user_id):
-    if hours is None or not 1 <= hours <= MAX_HOURS:
-        return f"ระบุจำนวนชั่วโมง 1-{MAX_HOURS} เช่น extend {iid} 1h"
+def extend_instance(iid, minutes, user_id):
+    if not valid_minutes(minutes):
+        return f"ระบุเวลา {MIN_MINUTES}m ถึง {MAX_HOURS}h เช่น extend {iid} 30m หรือ extend {iid} 1h"
     inst = get_owned_instance(iid, user_id)
     if not inst:
         return "ไม่พบเครื่องนี้ หรือไม่ใช่เครื่องของคุณ"
     now = utc_now()
     current = tags_of(inst).get("StopAt")
     base = max(now, parse_iso(current)) if current else now
-    new_stop = min(base + timedelta(hours=hours), now + timedelta(hours=MAX_HOURS))
-    set_tags(iid, StopAt=iso(new_stop), Warned="")
-    return f"⏱ ต่อเวลาเครื่อง {iid} แล้ว หยุดอัตโนมัติเวลา {th_time(new_stop)} น."
+    new_stop = min(base + timedelta(minutes=minutes), now + timedelta(hours=MAX_HOURS))
+    remaining = int((new_stop - now).total_seconds() // 60)
+    set_tags(iid, **schedule_tags(new_stop, remaining))
+    return (f"⏱ ต่อเวลาเครื่อง {iid} อีก {fmt_minutes(minutes)} แล้ว\n"
+            f"หยุดอัตโนมัติเวลา {th_time(new_stop)} น. (เตือนก่อน {warn_lead(remaining)} นาที)")
+
+
+def test_alarm(iid, user_id):
+    """จำลอง CPU alarm เพื่อทดสอบเส้นทาง CloudWatch -> EventBridge -> Lambda -> LINE จากแชท"""
+    inst = get_owned_instance(iid, user_id)
+    if not inst:
+        return "ไม่พบเครื่องนี้ หรือไม่ใช่เครื่องของคุณ"
+    name = f"{ALARM_PREFIX}{iid}"
+    if not cw.describe_alarms(AlarmNames=[name]).get("MetricAlarms"):
+        return "เครื่องนี้ไม่มี CPU alarm (สร้างจากบอทเวอร์ชันเก่า) ให้ขอเครื่องใหม่"
+    cw.set_alarm_state(AlarmName=name, StateValue="ALARM",
+                       StateReason="Test from LINE chat (test-alarm command)")
+    return ("🧪 จำลอง CPU alarm แล้ว\nภายในไม่กี่วินาทีจะได้ข้อความ 🚨 และประมาณ 1-2 นาทีต่อมา "
+            "alarm จะกลับเป็นปกติเองพร้อมข้อความ ✅\n"
+            f"ถ้าต้องการโหลด CPU จริง ใช้ run {iid} stress")
 
 
 def key_link_text(iid, user_id):
@@ -618,19 +666,20 @@ def sweep_schedules():
                 ec2.stop_instances(InstanceIds=[iid])
                 push(owner, [text(f"⏹ หยุดเครื่อง {iid} อัตโนมัติแล้ว เพราะครบเวลาใช้งาน\n"
                                   f"เปิดใหม่ได้ด้วย: start {iid}")])
-            elif now >= stop_at - timedelta(minutes=WARN_MINUTES) and t.get("Warned") != t["StopAt"]:
+            elif (now >= (parse_iso(t["WarnAt"]) if t.get("WarnAt") else stop_at - timedelta(minutes=WARN_MINUTES))
+                  and t.get("Warned") != t["StopAt"]):
                 set_tags(iid, Warned=t["StopAt"])  # เตือนครั้งเดียวต่อรอบเวลา
-                mins = int((stop_at - now).total_seconds() // 60)
+                mins = max(1, int((stop_at - now).total_seconds() // 60))
                 push(owner, [{
                     **text(f"⏰ เครื่อง {iid} ({t.get('Purpose', '-')}) จะหยุดอัตโนมัติในอีก "
                            f"{mins} นาที ({th_time(stop_at)} น.)"),
                     "quickReply": {"items": [
+                        {"type": "action", "action": {"type": "postback", "label": "ต่อเวลา 30 นาที",
+                                                      "data": f"a=extend&id={iid}&m=30",
+                                                      "displayText": "ต่อเวลา 30 นาที"}},
                         {"type": "action", "action": {"type": "postback", "label": "ต่อเวลา 1 ชม.",
-                                                      "data": f"a=extend&id={iid}&h=1",
+                                                      "data": f"a=extend&id={iid}&m=60",
                                                       "displayText": "ต่อเวลา 1 ชม."}},
-                        {"type": "action", "action": {"type": "postback", "label": "ต่อเวลา 2 ชม.",
-                                                      "data": f"a=extend&id={iid}&h=2",
-                                                      "displayText": "ต่อเวลา 2 ชม."}},
                         {"type": "action", "action": {"type": "postback", "label": "หยุดเลย",
                                                       "data": f"a=stopnow&id={iid}",
                                                       "displayText": "หยุดเลย"}},
